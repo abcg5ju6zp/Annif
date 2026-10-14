@@ -13,6 +13,7 @@ import click_log
 from flask.cli import FlaskGroup
 
 import annif
+import annif.checkpoint
 import annif.parallel
 import annif.project
 import annif.registry
@@ -442,6 +443,15 @@ def run_index(
 @click.option(
     "--jobs", "-j", default=1, help="Number of parallel jobs (0 means all CPUs)"
 )
+@click.option(
+    "--checkpoint-dir",
+    type=click.Path(file_okay=False),
+    default=None,
+    help="Directory for batch checkpoints. After every confirmed batch "
+    "the suggestions and evaluation state are saved there; an interrupted "
+    "or failed run resumes without repeating earlier inference, provided "
+    "the input documents, project and model version are unchanged.",
+)
 @cli_util.docs_limit_option
 @cli_util.backend_param_option
 @cli_util.common_options
@@ -455,6 +465,7 @@ def run_eval(
     metrics_file,
     results_file,
     jobs,
+    checkpoint_dir,
     backend_param,
 ):
     """
@@ -496,15 +507,102 @@ def run_eval(
     jobs, pool_class = annif.parallel.get_pool(jobs)
 
     project.initialize(parallel=True)
+
+    # Freeze the input: document order and identities are fixed for the
+    # whole job, so results of different runs can never be stitched
+    # together in the wrong order.
+    doc_batches = list(corpus.doc_batches)
+
+    checkpoint = None
+    if checkpoint_dir:
+        fingerprint = annif.checkpoint.JobFingerprint.build(
+            job_type="eval",
+            projects=[project],
+            backend_params=backend_params,
+            limit=limit,
+            threshold=threshold,
+            doc_batches=doc_batches,
+        )
+        checkpoint = annif.checkpoint.BatchCheckpoint.open(checkpoint_dir, fingerprint)
+
     psmap = annif.parallel.ProjectSuggestMap(
         project.registry, [project_id], backend_params, limit, threshold
     )
 
+    failure_records = []
     with pool_class(jobs) as pool:
-        for hit_sets, subject_sets in pool.imap_unordered(
-            psmap.suggest_batch, corpus.doc_batches
+        for outcome in annif.parallel.run_suggest_batches(
+            psmap, doc_batches, pool, checkpoint
         ):
-            eval_batch.evaluate_many(hit_sets[project_id], subject_sets)
+            if outcome.failures:
+                for failed_project, message in outcome.failures.items():
+                    logger.error(
+                        "Suggestion failed at batch %d for project %s: %s",
+                        outcome.index,
+                        failed_project,
+                        message,
+                    )
+                    failure_records.append(
+                        {
+                            "batch": outcome.index,
+                            "documents": outcome.documents,
+                            "error": message,
+                        }
+                    )
+                    if checkpoint is not None:
+                        checkpoint.record_failure(
+                            outcome.index,
+                            outcome.documents,
+                            failed_project,
+                            message,
+                            checkpoint.owner_id,
+                        )
+                continue
+
+            gold = outcome.gold
+            if gold is None:
+                gold = annif.eval.gold_subjects_array(
+                    outcome.subject_sets, project.subjects
+                )
+            for suggestion_batch in outcome.hit_sets.values():
+                eval_batch.evaluate_arrays(suggestion_batch.array, gold)
+            if checkpoint is not None:
+                try:
+                    checkpoint.save_batch(
+                        outcome.index,
+                        outcome.hit_sets,
+                        gold,
+                        checkpoint.owner_id,
+                    )
+                except annif.checkpoint.StaleOwnerError as err:
+                    logger.warning(
+                        "Discarding late batch result from a previous run: %s", err
+                    )
+
+    failures = checkpoint.failures if checkpoint is not None else failure_records
+
+    if failures:
+        details = "; ".join(
+            "batch {}: {} ({})".format(
+                failure["batch"],
+                ", ".join(
+                    annif.checkpoint.format_document_identity(identity)
+                    for identity in failure["documents"][:3]
+                ),
+                failure["error"],
+            )
+            for failure in failures
+        )
+        resume_hint = (
+            " Fix the problem and rerun the command to resume from the "
+            "last checkpoint."
+            if checkpoint is not None
+            else ""
+        )
+        raise OperationFailedException(
+            f"evaluation could not be completed for {len(failures)} batch(es): "
+            f"{details}.{resume_hint}"
+        )
 
     template = "{0:<30}\t{1:{fmt_spec}}"
     metrics = eval_batch.results(

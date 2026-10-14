@@ -1400,6 +1400,307 @@ def test_eval_two_jobs_spawn(tmpdir, monkeypatch):
     assert result.exit_code == 0
 
 
+def _metrics_output(output):
+    # strip checkpoint log lines that may precede the metric table
+    return output[output.index("Precision (doc avg)") :]
+
+
+def _write_eval_docs(tmpdir, n_docs=3, gold_labels=None):
+    if gold_labels is None:
+        # mirrors the other eval tests: doc3 has no subjects and is skipped
+        gold_labels = {1: "dummy", 2: "none"}
+    for doc_idx in range(1, n_docs + 1):
+        tmpdir.join(f"doc{doc_idx}.txt").write(f"doc{doc_idx}")
+        if doc_idx in gold_labels:
+            tmpdir.join(f"doc{doc_idx}.key").write(gold_labels[doc_idx])
+
+
+def _patch_dummy_suggest(monkeypatch, failing_texts=(), counter=None):
+    import annif.eval
+    from annif.backend.dummy import DummyBackend
+
+    original_suggest = DummyBackend._suggest
+
+    def _suggest(self, doc, params):
+        if counter is not None:
+            counter.append(doc.text)
+        if doc.text in failing_texts:
+            raise RuntimeError("simulated worker failure")
+        return original_suggest(self, doc, params)
+
+    monkeypatch.setattr(DummyBackend, "_suggest", _suggest)
+    return annif.eval
+
+
+def test_eval_checkpoint_replays_without_inference(tmpdir, monkeypatch):
+    _write_eval_docs(tmpdir)
+    checkpoint_dir = tmpdir.mkdir("checkpoint")
+
+    result = runner.invoke(
+        annif.cli.cli,
+        ["eval", "--checkpoint-dir", str(checkpoint_dir), "dummy-en", str(tmpdir)],
+    )
+    assert result.exit_code == 0
+    first_output = result.output
+
+    # all batches are cached now: model inference must not be repeated
+    from annif.backend.dummy import DummyBackend
+
+    def _forbidden_suggest(self, doc, params):
+        raise AssertionError("backend inference called although checkpoint is complete")
+
+    monkeypatch.setattr(DummyBackend, "_suggest", _forbidden_suggest)
+    result2 = runner.invoke(
+        annif.cli.cli,
+        ["eval", "--checkpoint-dir", str(checkpoint_dir), "dummy-en", str(tmpdir)],
+    )
+    assert result2.exit_code == 0
+    # replayed batches produce exactly the same metrics
+    assert _metrics_output(result2.output) == _metrics_output(first_output)
+    # batch outputs and manifest exist on disk
+    job_dirs = [p for p in checkpoint_dir.listdir() if p.isdir()]
+    assert len(job_dirs) == 1
+    assert job_dirs[0].join("manifest.json").check()
+    assert len(job_dirs[0].listdir("batch-*-gold.npz")) == 1
+
+
+def test_eval_checkpoint_resume_after_worker_failure(tmpdir, monkeypatch):
+    import annif.corpus.types
+
+    monkeypatch.setattr(annif.corpus.types.DocumentCorpus, "DOC_BATCH_SIZE", 2)
+    _write_eval_docs(tmpdir, n_docs=6, gold_labels={i: "dummy" for i in range(1, 7)})
+    checkpoint_dir = tmpdir.mkdir("checkpoint")
+
+    # first run: worker processing doc3 fails (serial mode so that the
+    # monkeypatched failure is visible)
+    with monkeypatch.context() as m:
+        _patch_dummy_suggest(m, failing_texts={"doc3"})
+        failed = runner.invoke(
+            annif.cli.cli,
+            [
+                "eval",
+                "--jobs",
+                "1",
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+                "dummy-en",
+                str(tmpdir),
+            ],
+        )
+    assert failed.exit_code != 0
+    assert "doc3.txt" in failed.output
+    assert "last checkpoint" in failed.output
+    job_dir = checkpoint_dir.listdir()[0]
+    # the failed batch keeps its boundary: batches 0 and 2 are committed
+    # (their inference succeeded) while batch 1 is recorded as failed
+    assert len(job_dir.listdir("batch-*-gold.npz")) == 2
+    import json
+
+    with open(job_dir.join("manifest.json"), encoding="utf-8") as manifest_file:
+        manifest = json.load(manifest_file)
+    assert [failure["batch"] for failure in manifest["failures"]] == [1]
+
+    # second run: only the failed batch (doc3, doc4) is inferred again
+    inferred = []
+    with monkeypatch.context() as m:
+        _patch_dummy_suggest(m, counter=inferred)
+        resumed = runner.invoke(
+            annif.cli.cli,
+            [
+                "eval",
+                "--jobs",
+                "1",
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+                "dummy-en",
+                str(tmpdir),
+            ],
+        )
+    assert resumed.exit_code == 0
+    assert inferred == ["doc3", "doc4"]
+    ndocs = re.search(r"Documents evaluated:\s+(\d+)", resumed.output)
+    assert int(ndocs.group(1)) == 6
+    f_measure = re.search(r"F1 score .*doc.*:\s+(\d.\d+)", resumed.output)
+    assert float(f_measure.group(1)) == pytest.approx(1.0)
+    assert len(job_dir.listdir("batch-*-gold.npz")) == 3
+
+
+def test_eval_worker_failure_without_checkpoint(tmpdir, monkeypatch):
+    _write_eval_docs(tmpdir)
+    with monkeypatch.context() as m:
+        _patch_dummy_suggest(m, failing_texts={"doc2"})
+        failed = runner.invoke(
+            annif.cli.cli,
+            ["eval", "--jobs", "1", "dummy-en", str(tmpdir)],
+        )
+    assert failed.exit_code != 0
+    assert "doc2.txt" in failed.output
+    # the pool is not killed by a single worker failure: all batches were
+    # still attempted
+    assert "evaluation could not be completed" in failed.output
+
+
+def test_eval_checkpoint_changed_arguments_start_fresh(tmpdir, monkeypatch):
+    _write_eval_docs(tmpdir)
+    checkpoint_dir = tmpdir.mkdir("checkpoint")
+
+    # first run with zeroed backend scores
+    first = runner.invoke(
+        annif.cli.cli,
+        [
+            "eval",
+            "--backend-param",
+            "dummy.score=0.0",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "dummy-en",
+            str(tmpdir),
+        ],
+    )
+    assert first.exit_code == 0
+    recall = re.search(r"Recall .*doc.*:\s+(\d.\d+)", first.output)
+    assert float(recall.group(1)) == pytest.approx(0.0)
+
+    # second run with different backend parameters: the old checkpoint is
+    # not reused, inference starts from scratch in a new job directory
+    inferred = []
+    with monkeypatch.context() as m:
+        _patch_dummy_suggest(m, counter=inferred)
+        second = runner.invoke(
+            annif.cli.cli,
+            [
+                "eval",
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+                "dummy-en",
+                str(tmpdir),
+            ],
+        )
+    assert second.exit_code == 0
+    assert len(inferred) >= 2
+    recall = re.search(r"Recall .*doc.*:\s+(\d.\d+)", second.output)
+    assert float(recall.group(1)) == pytest.approx(0.5)
+    assert len([p for p in checkpoint_dir.listdir() if p.isdir()]) == 2
+
+
+def test_eval_checkpoint_empty_corpus(tmpdir):
+    checkpoint_dir = tmpdir.mkdir("checkpoint")
+    empty_file = tmpdir.ensure("empty.tsv")
+    failed = runner.invoke(
+        annif.cli.cli,
+        [
+            "eval",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "dummy-fi",
+            str(empty_file),
+        ],
+    )
+    assert failed.exit_code != 0
+    assert "cannot evaluate empty corpus" in failed.output
+
+
+def test_eval_checkpoint_jobs2_then_serial_replay(tmpdir, monkeypatch):
+    _write_eval_docs(tmpdir)
+    checkpoint_dir = tmpdir.mkdir("checkpoint")
+
+    # populate the checkpoint using two worker processes
+    parallel_result = runner.invoke(
+        annif.cli.cli,
+        [
+            "eval",
+            "--jobs",
+            "2",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "dummy-en",
+            str(tmpdir),
+        ],
+    )
+    assert parallel_result.exit_code == 0
+
+    # replay serially; inference must be served entirely from the checkpoint
+    from annif.backend.dummy import DummyBackend
+
+    def _forbidden_suggest(self, doc, params):
+        raise AssertionError("backend inference called during serial replay")
+
+    monkeypatch.setattr(DummyBackend, "_suggest", _forbidden_suggest)
+    serial_result = runner.invoke(
+        annif.cli.cli,
+        [
+            "eval",
+            "--jobs",
+            "1",
+            "--checkpoint-dir",
+            str(checkpoint_dir),
+            "dummy-en",
+            str(tmpdir),
+        ],
+    )
+    assert serial_result.exit_code == 0
+    assert _metrics_output(serial_result.output) == _metrics_output(
+        parallel_result.output
+    )
+
+
+def test_eval_checkpoint_parent_write_failure_replays(tmpdir, monkeypatch):
+    _write_eval_docs(tmpdir)
+    checkpoint_dir = tmpdir.mkdir("checkpoint")
+
+    # first run computes everything but fails only when writing the final
+    # metrics; all batches must already be checkpointed by then
+    import annif.eval
+
+    original_results = annif.eval.EvaluationBatch.results
+    state = {"calls": 0}
+
+    def _failing_results(self, *args, **kwargs):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise OSError("simulated parent write failure")
+        return original_results(self, *args, **kwargs)
+
+    with monkeypatch.context() as m:
+        m.setattr(annif.eval.EvaluationBatch, "results", _failing_results)
+        failed = runner.invoke(
+            annif.cli.cli,
+            [
+                "eval",
+                "--jobs",
+                "1",
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+                "dummy-en",
+                str(tmpdir),
+            ],
+        )
+    assert failed.exit_code != 0
+
+    # rerun replays the computed batches without any new inference
+    from annif.backend.dummy import DummyBackend
+
+    def _forbidden_suggest(self, doc, params):
+        raise AssertionError("backend inference called during write replay")
+
+    with monkeypatch.context() as m:
+        m.setattr(DummyBackend, "_suggest", _forbidden_suggest)
+        resumed = runner.invoke(
+            annif.cli.cli,
+            [
+                "eval",
+                "--jobs",
+                "1",
+                "--checkpoint-dir",
+                str(checkpoint_dir),
+                "dummy-en",
+                str(tmpdir),
+            ],
+        )
+    assert resumed.exit_code == 0
+    assert "Documents evaluated" in resumed.output
+
+
 def test_optimize_dir(tmpdir):
     tmpdir.join("doc1.txt").write("doc1")
     tmpdir.join("doc1.key").write("dummy")
@@ -1423,11 +1724,9 @@ def test_optimize_dir(tmpdir):
 
 def test_optimize_docfile(tmpdir):
     docfile = tmpdir.join("documents.tsv")
-    docfile.write(
-        """Läntinen\t<http://www.yso.fi/onto/yso/p2557>
+    docfile.write("""Läntinen\t<http://www.yso.fi/onto/yso/p2557>
         Oulunlinnan\t<http://www.yso.fi/onto/yso/p7346>
-        Harald Hirmuinen\t<http://www.yso.fi/onto/yso/p6479>"""
-    )
+        Harald Hirmuinen\t<http://www.yso.fi/onto/yso/p6479>""")
 
     result = runner.invoke(annif.cli.cli, ["optimize", "dummy-fi", str(docfile)])
     assert not result.exception

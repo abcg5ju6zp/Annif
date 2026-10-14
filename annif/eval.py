@@ -41,6 +41,21 @@ def false_negatives(y_true: csr_array, y_pred: csr_array) -> int:
     return int((y_true > y_pred).sum())
 
 
+def gold_subjects_array(
+    gold_subject_batch: Sequence[SubjectSet], subject_index: SubjectIndex
+) -> csr_array:
+    """convert a batch of gold SubjectSets to a boolean sparse matrix
+    with one row per document"""
+
+    ar = scipy.sparse.dok_array(
+        (len(gold_subject_batch), len(subject_index)), dtype=bool
+    )
+    for idx, subject_set in enumerate(gold_subject_batch):
+        for subject_id in subject_set:
+            ar[idx, subject_id] = True
+    return ar.tocsr()
+
+
 def dcg_score(
     y_true: csr_array, y_pred: csr_array, limit: int | None = None
 ) -> np.float64:
@@ -85,6 +100,16 @@ class EvaluationBatch:
         self._suggestion_arrays = []
         self._gold_subject_arrays = []
 
+    def evaluate_arrays(
+        self, suggestion_array: csr_array, gold_array: csr_array
+    ) -> None:
+        """Add one confirmed batch to the evaluation aggregate using the
+        sparse arrays directly. This is the stable aggregation boundary
+        used when batches are replayed from a checkpoint."""
+
+        self._suggestion_arrays.append(scipy.sparse.csr_array(suggestion_array))
+        self._gold_subject_arrays.append(scipy.sparse.csr_array(gold_array))
+
     def evaluate_many(
         self,
         suggestion_batch: (
@@ -96,16 +121,8 @@ class EvaluationBatch:
             suggestion_batch = SuggestionBatch.from_sequence(
                 suggestion_batch, self._subject_index
             )
-        self._suggestion_arrays.append(suggestion_batch.array)
-
-        # convert gold_subject_batch to sparse matrix
-        ar = scipy.sparse.dok_array(
-            (len(gold_subject_batch), len(self._subject_index)), dtype=bool
-        )
-        for idx, subject_set in enumerate(gold_subject_batch):
-            for subject_id in subject_set:
-                ar[idx, subject_id] = True
-        self._gold_subject_arrays.append(ar.tocsr())
+        gold_array = gold_subjects_array(gold_subject_batch, self._subject_index)
+        self.evaluate_arrays(suggestion_batch.array, gold_array)
 
     def _evaluate_samples(
         self,
