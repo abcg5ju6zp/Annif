@@ -20,23 +20,18 @@ def _get_json_schema(schema_name):
         return json.load(schema_file)
 
 
-def _subjects_to_subject_set(subjects, subject_index, language):
-    subject_ids = []
-    for subj in subjects:
-        if "uri" in subj:
-            subject_ids.append(subject_index.by_uri(subj["uri"]))
-        else:
-            subject_ids.append(subject_index.by_label(subj["label"], language))
-    return SubjectSet(subject_ids)
-
-
 def json_to_document(
     filename: str,
     json_data: str,
     subject_index: SubjectIndex | None,
     language: str,
     require_subjects: bool,
+    retain_subjectless: bool = False,
 ) -> Document | None:
+    """parse a JSON/JSONL document string. When retain_subjectless is True,
+    documents without any scorable subjects are retained (with the evidence of
+    why their annotations could not be used) instead of being dropped, so that
+    evaluation entry points can account for them consistently."""
 
     import jsonschema
 
@@ -53,10 +48,10 @@ def json_to_document(
         return None
 
     if require_subjects or (subject_index is not None and "subjects" in data):
-        subject_set = _subjects_to_subject_set(
+        subject_set = SubjectSet.from_subject_dicts(
             data.get("subjects", []), subject_index, language
         )
-        if not subject_set:
+        if not subject_set.is_scorable and not retain_subjectless:
             return None
     else:
         subject_set = None
@@ -75,6 +70,7 @@ def json_file_to_document(
     subject_index: SubjectIndex | None,
     language: str,
     require_subjects: bool,
+    retain_subjectless: bool = False,
 ) -> Document | None:
     if os.path.getsize(filename) == 0:
         logger.warning(f"Skipping empty file {filename}")
@@ -84,5 +80,10 @@ def json_file_to_document(
         json_data = jsonfile.read()
 
     return json_to_document(
-        filename, json_data, subject_index, language, require_subjects
+        filename,
+        json_data,
+        subject_index,
+        language,
+        require_subjects,
+        retain_subjectless,
     )

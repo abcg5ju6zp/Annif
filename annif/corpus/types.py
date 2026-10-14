@@ -82,11 +82,27 @@ class DocumentCorpus(metaclass=abc.ABCMeta):
 
 
 class SubjectSet:
-    """Represents a set of subjects for a document."""
+    """Represents a set of subjects for a document.
 
-    def __init__(self, subject_ids: Any | None = None) -> None:
+    Besides the accepted (mapped to the project subject space) subject IDs,
+    the set carries the evidence of how the gold-standard annotations of the
+    document were resolved: the original number of annotations
+    (``annotation_count``) and a list of ``(reference, reason)`` pairs for
+    every annotation that could not be accepted. This lets all corpus readers
+    share the same scorable-evidence determination."""
+
+    def __init__(
+        self,
+        subject_ids: Any | None = None,
+        annotation_count: int | None = None,
+        excluded_annotations: list[tuple[str, str]] | None = None,
+    ) -> None:
         """Create a SubjectSet and optionally initialize it from an iterable
-        of subject IDs"""
+        of subject IDs. ``annotation_count`` is the number of annotations in
+        the original gold standard (accepted and excluded ones counted);
+        ``excluded_annotations`` is a list of ``(reference, reason)`` pairs
+        for annotations that could not be mapped to the project subject
+        space."""
 
         if subject_ids:
             # use set comprehension to eliminate possible duplicates
@@ -95,6 +111,12 @@ class SubjectSet:
             )
         else:
             self._subject_ids = []
+        self.annotation_count = (
+            annotation_count if annotation_count is not None else len(self._subject_ids)
+        )
+        self.excluded_annotations = (
+            list(excluded_annotations) if excluded_annotations else []
+        )
 
     def __len__(self) -> int:
         return len(self._subject_ids)
@@ -105,6 +127,26 @@ class SubjectSet:
     def __bool__(self) -> bool:
         return bool(self._subject_ids)
 
+    @property
+    def has_annotations(self) -> bool:
+        """return True if the original gold standard contained at least one
+        annotation for this document, even if none of them could be mapped"""
+
+        return self.annotation_count > 0
+
+    @property
+    def is_scorable(self) -> bool:
+        """return True if the document has at least one gold-standard subject
+        that maps to the project subject space and can thus be scored"""
+
+        return bool(self._subject_ids)
+
+    def exclusion_reasons(self) -> collections.Counter:
+        """return a Counter of exclusion reasons for the annotations of this
+        document"""
+
+        return collections.Counter(reason for _, reason in self.excluded_annotations)
+
     def __eq__(self, other: Any) -> bool:
         if isinstance(other, SubjectSet):
             return self._subject_ids == other._subject_ids
@@ -112,17 +154,70 @@ class SubjectSet:
         return False
 
     @classmethod
+    def _resolve(
+        cls,
+        subject_index: SubjectIndex,
+        language: str | None,
+        uris: Any = (),
+        labels: Any = (),
+    ) -> SubjectSet:
+        """resolve URIs and labels against the subject index, recording every
+        accepted and excluded annotation with its exclusion reason"""
+
+        subject_ids = set()
+        excluded_annotations = []
+        for uri in uris:
+            subject_id, reason = subject_index.resolve_uri(uri)
+            if subject_id is not None:
+                subject_ids.add(subject_id)
+            else:
+                excluded_annotations.append((uri, reason))
+        for label in labels:
+            subject_id, reason = subject_index.resolve_label(label, language)
+            if subject_id is not None:
+                subject_ids.add(subject_id)
+            else:
+                excluded_annotations.append((str(label), reason))
+        annotation_count = len(uris) + len(labels)
+        return cls(
+            subject_ids,
+            annotation_count=annotation_count,
+            excluded_annotations=excluded_annotations,
+        )
+
+    @classmethod
+    def from_uri_references(cls, uris: Any, subject_index: SubjectIndex) -> SubjectSet:
+        """create a SubjectSet from an iterable of subject URIs, recording
+        unknown, deprecated and filtered URIs as excluded annotations"""
+
+        uri_list = list(uris)
+        return cls._resolve(subject_index, language=None, uris=uri_list)
+
+    @classmethod
+    def from_subject_dicts(
+        cls, subjects: Any, subject_index: SubjectIndex, language: str
+    ) -> SubjectSet:
+        """create a SubjectSet from an iterable of subject dicts such as the
+        ones used by JSON/JSONL corpora, each having either a 'uri' or a
+        'label' key"""
+
+        uris = [subj["uri"] for subj in subjects if "uri" in subj]
+        labels = [subj["label"] for subj in subjects if "uri" not in subj]
+        return cls._resolve(subject_index, language, uris=uris, labels=labels)
+
+    @classmethod
     def from_string(
         cls, subj_data: str, subject_index: SubjectIndex, language: str
     ) -> SubjectSet:
-        subject_ids = set()
+        uris = []
+        labels = []
         for line in subj_data.splitlines():
             uri, label = cls._parse_line(line)
             if uri is not None:
-                subject_ids.add(subject_index.by_uri(uri))
-            else:
-                subject_ids.add(subject_index.by_label(label, language))
-        return cls(subject_ids)
+                uris.append(uri)
+            elif label is not None:
+                labels.append(label)
+        return cls._resolve(subject_index, language, uris=uris, labels=labels)
 
     @staticmethod
     def _parse_line(

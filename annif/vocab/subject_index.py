@@ -8,7 +8,15 @@ import annif
 import annif.util
 
 from .subject_file import VocabFileCSV
-from .types import Subject, SubjectIndex, VocabSource
+from .types import (
+    REASON_DEPRECATED_SUBJECT,
+    REASON_EXCLUDED_SUBJECT,
+    REASON_UNKNOWN_LABEL,
+    REASON_UNKNOWN_URI,
+    Subject,
+    SubjectIndex,
+    VocabSource,
+)
 
 logger = annif.logger
 logger.addFilter(annif.util.DuplicateFilter())
@@ -57,23 +65,36 @@ class SubjectIndexFile(SubjectIndex):
     def contains_uri(self, uri: str) -> bool:
         return uri in self._uri_idx
 
-    def by_uri(self, uri: str, warnings: bool = True) -> int | None:
+    def resolve_uri(
+        self, uri: str, warnings: bool = True
+    ) -> tuple[int | None, str | None]:
         try:
             subject_id = self._uri_idx[uri]
-            if self._subjects[subject_id].labels is None:  # deprecated
-                return None
-            return subject_id
         except KeyError:
             if warnings:
                 logger.warning("Unknown subject URI <%s>", uri)
-            return None
+            return None, REASON_UNKNOWN_URI
+        if self._subjects[subject_id].labels is None:  # deprecated
+            return None, REASON_DEPRECATED_SUBJECT
+        return subject_id, None
+
+    def by_uri(self, uri: str, warnings: bool = True) -> int | None:
+        subject_id, _reason = self.resolve_uri(uri, warnings)
+        return subject_id
+
+    def resolve_label(
+        self, label: str | None, language: str, warnings: bool = True
+    ) -> tuple[int | None, str | None]:
+        try:
+            return self._label_idx[(label, language)], None
+        except KeyError:
+            if warnings:
+                logger.warning('Unknown subject label "%s"@%s', label, language)
+            return None, REASON_UNKNOWN_LABEL
 
     def by_label(self, label: str | None, language: str) -> int | None:
-        try:
-            return self._label_idx[(label, language)]
-        except KeyError:
-            logger.warning('Unknown subject label "%s"@%s', label, language)
-            return None
+        subject_id, _reason = self.resolve_label(label, language)
+        return subject_id
 
     @property
     def active(self) -> list[tuple[int, Subject]]:
@@ -134,23 +155,38 @@ class SubjectIndexFilter(SubjectIndex):
             return False
         return self._subject_index.contains_uri(uri)
 
+    def resolve_uri(
+        self, uri: str, warnings: bool = True
+    ) -> tuple[int | None, str | None]:
+        if uri in self._exclude:
+            return None, REASON_EXCLUDED_SUBJECT
+        return self._subject_index.resolve_uri(uri, warnings)
+
     def by_uri(self, uri: str, warnings: bool = True) -> int | None:
         """return the subject ID of a subject by its URI, or None if not found.
         If warnings=True, log a warning message if the URI cannot be found."""
 
-        if uri in self._exclude:
-            return None
-        return self._subject_index.by_uri(uri, warnings)
+        subject_id, _reason = self.resolve_uri(uri, warnings)
+        return subject_id
+
+    def resolve_label(
+        self, label: str | None, language: str, warnings: bool = True
+    ) -> tuple[int | None, str | None]:
+        subject_id, reason = self._subject_index.resolve_label(
+            label, language, warnings
+        )
+        if subject_id is None:
+            return None, reason
+        if self._subject_index[subject_id].uri in self._exclude:
+            return None, REASON_EXCLUDED_SUBJECT
+        return subject_id, None
 
     def by_label(self, label: str | None, language: str) -> int | None:
         """return the subject ID of a subject by its label in a given
         language"""
 
-        subject_id = self._subject_index.by_label(label, language)
-        subject = self._subject_index[subject_id]
-        if subject is not None and subject.uri not in self._exclude:
-            return subject_id
-        return None
+        subject_id, _reason = self.resolve_label(label, language)
+        return subject_id
 
     @property
     def active(self) -> list[tuple[int, Subject]]:

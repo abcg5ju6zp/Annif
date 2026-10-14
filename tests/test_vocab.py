@@ -203,6 +203,72 @@ def test_subject_by_label_missing(subject_index):
     assert subj_id is None
 
 
+def test_resolve_uri(subject_index):
+    subj_id, reason = subject_index.resolve_uri(
+        "http://www.yso.fi/onto/yso/p7141"
+    )
+    assert subject_index[subj_id].labels["fi"] == "sinetit"
+    assert reason is None
+
+    assert subject_index.resolve_uri("http://nonexistent") == (
+        None,
+        "unknown_uri",
+    )
+
+
+def test_resolve_uri_deprecated():
+    index = annif.vocab.SubjectIndexFile()
+    index.append(annif.vocab.Subject("http://example.org/active", {"en": "active"}, None))
+    index.append(
+        annif.vocab.Subject("http://example.org/deprecated", None, None)
+    )
+    assert index.resolve_uri("http://example.org/active") == (0, None)
+    assert index.resolve_uri("http://example.org/deprecated") == (
+        None,
+        "deprecated_subject",
+    )
+    # deprecated URIs keep resolving to None silently via by_uri
+    assert index.by_uri("http://example.org/deprecated") is None
+
+
+def test_resolve_label(subject_index):
+    subj_id, reason = subject_index.resolve_label("sinetit", "fi")
+    assert reason is None
+    assert subject_index[subj_id].uri == "http://www.yso.fi/onto/yso/p7141"
+
+    assert subject_index.resolve_label("nonexistent", "fi") == (
+        None,
+        "unknown_label",
+    )
+
+
+def test_subject_index_filter_resolve(subject_index):
+    excluded_uri = "http://www.yso.fi/onto/yso/p7141"  # sinetit@fi
+    included_uri = "http://www.yso.fi/onto/yso/p1265"  # arkeologia@fi
+
+    subject_filter = annif.vocab.SubjectIndexFilter(
+        subject_index, exclude=[excluded_uri]
+    )
+
+    assert subject_filter.resolve_uri(excluded_uri) == (None, "excluded_subject")
+    subj_id, reason = subject_filter.resolve_uri(included_uri)
+    assert subj_id is not None
+    assert reason is None
+    assert subject_filter.resolve_uri("http://nonexistent") == (
+        None,
+        "unknown_uri",
+    )
+
+    assert subject_filter.resolve_label("sinetit", "fi") == (
+        None,
+        "excluded_subject",
+    )
+    assert subject_filter.resolve_label("nonexistent", "fi") == (
+        None,
+        "unknown_label",
+    )
+
+
 def test_subject_index_filter(subject_index):
     excluded_uri = "http://www.yso.fi/onto/yso/p7141"  # sinetit@fi
     included_uri = "http://www.yso.fi/onto/yso/p1265"  # arkeologia@fi

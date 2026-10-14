@@ -10,6 +10,7 @@ from .document import (
     LimitingDocumentCorpus,
     TransformingDocumentCorpus,
 )
+from .evidence import GoldCorpusCoverage, ScorableDocumentCorpus
 from .types import Document, SubjectSet
 
 __all__ = [
@@ -23,4 +24,6 @@ __all__ = [
     "CombinedCorpus",
     "TransformingDocumentCorpus",
     "LimitingDocumentCorpus",
+    "GoldCorpusCoverage",
+    "ScorableDocumentCorpus",
 ]

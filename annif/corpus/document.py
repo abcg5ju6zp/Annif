@@ -35,11 +35,13 @@ class DocumentDirectory(DocumentCorpus):
         subject_index: SubjectIndex | None = None,
         language: str | None = None,
         require_subjects: bool = False,
+        retain_subjectless: bool = False,
     ) -> None:
         self.path = path
         self.subject_index = subject_index
         self.language = language
         self.require_subjects = require_subjects
+        self.retain_subjectless = retain_subjectless
 
     def __iter__(self) -> Iterator[str]:
         """Iterate through the directory, yielding file paths with corpus documents."""
@@ -72,6 +74,12 @@ class DocumentDirectory(DocumentCorpus):
 
         subjfilename = self._get_subject_filename(filename)
         if subjfilename is None:
+            if self.retain_subjectless:
+                # subjects not found; retain the document as one without
+                # annotations so that evaluation can account for it
+                return Document(
+                    text=text, subject_set=SubjectSet(), file_path=filename
+                )
             # subjects required but not found, skipping this docfile
             return None
 
@@ -92,6 +100,7 @@ class DocumentDirectory(DocumentCorpus):
                     self.subject_index,
                     self.language,
                     self.require_subjects,
+                    self.retain_subjectless,
                 )
 
             if doc is not None:
@@ -121,11 +130,11 @@ class DocumentFileTSV(DocumentCorpus):
     def _parse_tsv_line(self, line: str) -> Iterator[Document]:
         if "\t" in line:
             text, uris = line.split("\t", maxsplit=1)
-            subject_ids = {
-                self.subject_index.by_uri(annif.util.cleanup_uri(uri))
-                for uri in uris.split()
-            }
-            yield Document(text=text, subject_set=SubjectSet(subject_ids))
+            subject_set = SubjectSet.from_uri_references(
+                (annif.util.cleanup_uri(uri) for uri in uris.split()),
+                self.subject_index,
+            )
+            yield Document(text=text, subject_set=subject_set)
         else:
             if self.require_subjects:
                 logger.warning(
@@ -173,12 +182,15 @@ class DocumentFileCSV(DocumentCorpus):
         if self.require_subjects or (
             self.subject_index is not None and "subject_uris" in row
         ):
-            subject_ids = {
-                self.subject_index.by_uri(annif.util.cleanup_uri(uri))
-                for uri in (row["subject_uris"] or "").strip().split()
-            }
+            subject_set = SubjectSet.from_uri_references(
+                (
+                    annif.util.cleanup_uri(uri)
+                    for uri in (row["subject_uris"] or "").strip().split()
+                ),
+                self.subject_index,
+            )
         else:
-            subject_ids = set()
+            subject_set = SubjectSet()
         metadata = {
             key: val
             for key, val in row.items()
@@ -186,7 +198,7 @@ class DocumentFileCSV(DocumentCorpus):
         }
         yield Document(
             text=(row["text"] or ""),
-            subject_set=SubjectSet(subject_ids),
+            subject_set=subject_set,
             metadata=metadata,
             document_id=row.get("document_id", None),
         )
@@ -215,11 +227,13 @@ class DocumentFileJSONL(DocumentCorpus):
         subject_index: SubjectIndex,
         language: str,
         require_subjects=True,
+        retain_subjectless: bool = False,
     ) -> None:
         self.path = path
         self.subject_index = subject_index
         self.language = language
         self.require_subjects = require_subjects
+        self.retain_subjectless = retain_subjectless
 
     @property
     def documents(self) -> Iterator[Document]:
@@ -235,6 +249,7 @@ class DocumentFileJSONL(DocumentCorpus):
                     self.subject_index,
                     self.language,
                     self.require_subjects,
+                    self.retain_subjectless,
                 )
                 if doc is not None:
                     yield doc

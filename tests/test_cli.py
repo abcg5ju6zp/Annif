@@ -1222,8 +1222,17 @@ def test_eval_metric(tmpdir):
     assert float(f1.group(1)) > 0.0
     ndcg = re.search(r"NDCG\s*:\s+(\d.\d+)", result.output)
     assert float(ndcg.group(1)) > 0.0
-    # check that we only have 2 metrics + "Documents evaluated"
-    assert len(result.output.strip().split("\n")) == 3
+    # 2 selected metrics + "Documents evaluated" + 8 coverage lines
+    assert len(result.output.strip().split("\n")) == 11
+    # doc3 has no subject file and is excluded, not scored as empty gold
+    ndocs = re.search(r"Documents evaluated:\s+(\d+)", result.output)
+    assert int(ndocs.group(1)) == 2
+    excluded_docs = re.search(r"Documents excluded:\s+(\d+)", result.output)
+    assert int(excluded_docs.group(1)) == 1
+    no_annotations = re.search(
+        r"Documents without annotations:\s+(\d+)", result.output
+    )
+    assert int(no_annotations.group(1)) == 1
 
 
 def test_eval_metricsfile(tmpdir):
@@ -1247,6 +1256,18 @@ def test_eval_metricsfile(tmpdir):
     assert metrics["NDCG"] > 0.0
     assert "Precision_doc_avg" in metrics
     assert metrics["Precision_doc_avg"] > 0.0
+    # machine-readable coverage statistics
+    assert metrics["Documents_evaluated"] == 2
+    assert metrics["documents_excluded"] == 1
+    assert metrics["documents_without_annotations"] == 1
+    assert metrics["documents_with_unscorable_annotations"] == 0
+    assert metrics["annotations_excluded"] == 0
+    assert metrics["excluded_annotations_by_reason"] == {
+        "unknown_uri": 0,
+        "deprecated_subject": 0,
+        "excluded_subject": 0,
+        "unknown_label": 0,
+    }
 
 
 def test_eval_resultsfile(tmpdir):
@@ -1290,8 +1311,12 @@ def test_eval_resultsfile(tmpdir):
                 "F1_score",
             ]
         )
+        coverage_lines = []
         for line in f:
             assert line.strip() != ""
+            if line.startswith("#"):
+                coverage_lines.append(line)
+                continue
             parts = line.split("\t")
             if parts[1] == "dummy":
                 assert int(parts[2]) == 1
@@ -1310,6 +1335,12 @@ def test_eval_resultsfile(tmpdir):
     assert precision_numerator / denominator == precision
     assert recall_numerator / denominator == recall
     assert round(f_measure_numerator / denominator, 4) == f_measure
+    # the per-subject file also carries the coverage statistics
+    coverage_text = "".join(coverage_lines)
+    assert "# Gold standard coverage" in coverage_text
+    assert "# Documents evaluated:\t2" in coverage_text
+    assert "# Documents excluded:\t1" in coverage_text
+    assert "# Documents without annotations:\t1" in coverage_text
 
 
 def test_eval_badresultsfile(tmpdir):
@@ -1331,9 +1362,143 @@ def test_eval_docfile():
     docfile = os.path.join(
         os.path.dirname(__file__), "corpora", "archaeology", "documents.tsv"
     )
+    # none of the YSO URIs in the file map to the dummy vocabulary, so the
+    # evaluation must fail explicitly instead of scoring empty gold standards
     result = runner.invoke(annif.cli.cli, ["eval", "dummy-fi", docfile])
+    assert result.exception
+    assert result.exit_code != 0
+    assert "no documents with a scorable gold standard" in result.output
+    assert "Documents evaluated" not in result.output
+
+
+def test_eval_docfile_scorable_tsv(tmpdir):
+    docfile = tmpdir.join("documents.tsv")
+    docfile.write(
+        "doc1\t<http://example.org/dummy>\n"
+        "doc2\t<http://example.org/none>\n"
+        "doc3\t<http://example.org/unknown>\n"
+    )
+    result = runner.invoke(annif.cli.cli, ["eval", "dummy-en", str(docfile)])
     assert not result.exception
     assert result.exit_code == 0
+    ndocs = re.search(r"Documents evaluated:\s+(\d+)", result.output)
+    assert int(ndocs.group(1)) == 2
+    excluded_docs = re.search(r"Documents excluded:\s+(\d+)", result.output)
+    assert int(excluded_docs.group(1)) == 1
+    excluded_annotations = re.search(r"Annotations excluded:\s+(\d+)", result.output)
+    assert int(excluded_annotations.group(1)) == 1
+    unknown = re.search(r"Annotations excluded \(unknown_uri\):\s+(\d+)", result.output)
+    assert int(unknown.group(1)) == 1
+
+
+def test_eval_all_unscorable_fails(tmpdir):
+    for ext, content in (
+        (
+            "documents.tsv",
+            "doc1\t<http://example.org/unknown1>\n"
+            "doc2\t<http://example.org/unknown2>\n",
+        ),
+        (
+            "documents.csv",
+            "text,subject_uris\n"
+            "doc1,<http://example.org/unknown1>\n"
+            "doc2,<http://example.org/unknown2>\n",
+        ),
+        (
+            "documents.jsonl",
+            '{"text": "doc1", "subjects": [{"uri": '
+            '"http://example.org/unknown1"}]}\n'
+            '{"text": "doc2", "subjects": [{"uri": '
+            '"http://example.org/unknown2"}]}\n',
+        ),
+    ):
+        docfile = tmpdir.join(ext)
+        docfile.write(content)
+        result = runner.invoke(annif.cli.cli, ["eval", "dummy-en", str(docfile)])
+        assert result.exception
+        assert result.exit_code != 0
+        assert "no documents with a scorable gold standard" in result.output
+
+
+def _write_eval_corpus_in_every_format(tmpdir):
+    # doc1 and doc2 have valid gold subjects, doc3 only an unknown URI and
+    # doc4 no annotations at all; the same logical corpus in every format
+    tsv = tmpdir.join("documents.tsv")
+    tsv.write(
+        "doc1\t<http://example.org/dummy>\n"
+        "doc2\t<http://example.org/none>\n"
+        "doc3\t<http://example.org/unknown>\n"
+        "doc4\t\n"
+    )
+    csvfile = tmpdir.join("documents.csv")
+    csvfile.write(
+        "document_id,text,subject_uris\n"
+        "d1,doc1,<http://example.org/dummy>\n"
+        "d2,doc2,<http://example.org/none>\n"
+        "d3,doc3,<http://example.org/unknown>\n"
+        'd4,doc4,""\n'
+    )
+    jsonl = tmpdir.join("documents.jsonl")
+    jsonl.write(
+        '{"document_id": "d1", "text": "doc1", "subjects": '
+        '[{"uri": "http://example.org/dummy"}]}\n'
+        '{"document_id": "d2", "text": "doc2", "subjects": '
+        '[{"uri": "http://example.org/none"}]}\n'
+        '{"document_id": "d3", "text": "doc3", "subjects": '
+        '[{"uri": "http://example.org/unknown"}]}\n'
+        '{"document_id": "d4", "text": "doc4"}\n'
+    )
+    docdir = tmpdir.mkdir("fulltext")
+    docdir.join("doc1.txt").write("doc1")
+    docdir.join("doc1.key").write("dummy")
+    docdir.join("doc2.txt").write("doc2")
+    docdir.join("doc2.key").write("none")
+    docdir.join("doc3.txt").write("doc3")
+    docdir.join("doc3.key").write("<http://example.org/unknown>")
+    docdir.join("doc4.txt").write("doc4")
+    return tsv, csvfile, jsonl, docdir
+
+
+def test_eval_cross_format_consistency(tmpdir):
+    paths = _write_eval_corpus_in_every_format(tmpdir)
+    outputs = []
+    for path in paths:
+        result = runner.invoke(annif.cli.cli, ["eval", "dummy-en", str(path)])
+        assert not result.exception
+        assert result.exit_code == 0
+        outputs.append(result.output)
+
+    patterns = [
+        r"Documents evaluated:\s+(\d+)",
+        r"Documents excluded:\s+(\d+)",
+        r"Documents without annotations:\s+(\d+)",
+        r"Documents with only unscorable annotations:\s+(\d+)",
+        r"Annotations excluded:\s+(\d+)",
+        r"Annotations excluded \(unknown_uri\):\s+(\d+)",
+    ]
+    expected = [2, 2, 1, 1, 1, 1]
+    for output in outputs:
+        assert [int(re.search(p, output).group(1)) for p in patterns] == expected
+
+
+def test_eval_cross_format_consistency_parallel(tmpdir):
+    tsv, _csvfile, _jsonl, docdir = _write_eval_corpus_in_every_format(tmpdir)
+    for jobs in ("1", "2"):
+        for path in (tsv, docdir):
+            result = runner.invoke(
+                annif.cli.cli,
+                ["eval", "--jobs", jobs, "dummy-en", str(path)],
+            )
+            assert not result.exception
+            assert int(
+                re.search(r"Documents evaluated:\s+(\d+)", result.output).group(1)
+            ) == 2
+            assert int(
+                re.search(r"Documents excluded:\s+(\d+)", result.output).group(1)
+            ) == 2
+            assert int(
+                re.search(r"Annotations excluded:\s+(\d+)", result.output).group(1)
+            ) == 1
 
 
 def test_eval_empty_file(tmpdir):
@@ -1424,14 +1589,50 @@ def test_optimize_dir(tmpdir):
 def test_optimize_docfile(tmpdir):
     docfile = tmpdir.join("documents.tsv")
     docfile.write(
-        """Läntinen\t<http://www.yso.fi/onto/yso/p2557>
-        Oulunlinnan\t<http://www.yso.fi/onto/yso/p7346>
-        Harald Hirmuinen\t<http://www.yso.fi/onto/yso/p6479>"""
+        "doc1\t<http://example.org/dummy>\n"
+        "doc2\t<http://example.org/none>\n"
+        "doc3\t<http://example.org/unknown>\n"
     )
 
-    result = runner.invoke(annif.cli.cli, ["optimize", "dummy-fi", str(docfile)])
+    result = runner.invoke(annif.cli.cli, ["optimize", "dummy-en", str(docfile)])
     assert not result.exception
     assert result.exit_code == 0
+    # only the two documents with valid gold subjects are optimized over
+    ndocs = re.search(r"Documents evaluated:\s+(\d+)", result.output)
+    assert int(ndocs.group(1)) == 2
+    excluded_docs = re.search(r"Documents excluded:\s+(\d+)", result.output)
+    assert int(excluded_docs.group(1)) == 1
+    excluded_annotations = re.search(r"Annotations excluded:\s+(\d+)", result.output)
+    assert int(excluded_annotations.group(1)) == 1
+
+
+def test_optimize_all_unscorable_fails(tmpdir):
+    docfile = tmpdir.join("documents.tsv")
+    docfile.write(
+        "doc1\t<http://example.org/unknown1>\n"
+        "doc2\t<http://example.org/unknown2>\n"
+    )
+    result = runner.invoke(annif.cli.cli, ["optimize", "dummy-en", str(docfile)])
+    assert result.exception
+    assert result.exit_code != 0
+    assert "no documents with a scorable gold standard" in result.output
+
+
+def test_hyperopt_all_unscorable_fails(tmpdir):
+    tmpdir.join("doc1.txt").write("doc1")
+    tmpdir.join("doc1.key").write("<http://example.org/unknown>")
+    result = runner.invoke(annif.cli.cli, ["hyperopt", "ensemble", str(tmpdir)])
+    assert result.exception
+    assert result.exit_code != 0
+    assert "no documents with a scorable gold standard" in result.output
+
+
+def test_hyperopt_no_annotations_fails(tmpdir):
+    tmpdir.join("doc1.txt").write("doc1")
+    result = runner.invoke(annif.cli.cli, ["hyperopt", "ensemble", str(tmpdir)])
+    assert result.exception
+    assert result.exit_code != 0
+    assert "no documents with a scorable gold standard" in result.output
 
 
 def test_optimize_nonexistent_path():

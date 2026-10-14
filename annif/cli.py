@@ -17,7 +17,12 @@ import annif.parallel
 import annif.project
 import annif.registry
 from annif import cli_util, hfh_util
-from annif.corpus import Document, DocumentDirectory
+from annif.corpus import (
+    Document,
+    DocumentDirectory,
+    GoldCorpusCoverage,
+    ScorableDocumentCorpus,
+)
 from annif.exception import (
     NotInitializedException,
     NotSupportedException,
@@ -491,8 +496,19 @@ def run_eval(
                 "cannot open results-file for writing: " + str(e)
             )
     corpus = cli_util.open_documents(
-        paths, project.subjects, project.vocab_lang, docs_limit
+        paths,
+        project.subjects,
+        project.vocab_lang,
+        docs_limit,
+        retain_subjectless=True,
     )
+
+    # determine the scorable evidence before any suggestions or metrics are
+    # calculated; fail early if no document has a valid gold standard
+    coverage = GoldCorpusCoverage.from_corpus(corpus)
+    coverage.require_scorable_documents()
+    scorable_corpus = ScorableDocumentCorpus(corpus)
+
     jobs, pool_class = annif.parallel.get_pool(jobs)
 
     project.initialize(parallel=True)
@@ -502,7 +518,7 @@ def run_eval(
 
     with pool_class(jobs) as pool:
         for hit_sets, subject_sets in pool.imap_unordered(
-            psmap.suggest_batch, corpus.doc_batches
+            psmap.suggest_batch, scorable_corpus.doc_batches
         ):
             eval_batch.evaluate_many(hit_sets[project_id], subject_sets)
 
@@ -516,12 +532,14 @@ def run_eval(
         elif isinstance(score, float):
             fmt_spec = ".04f"
         click.echo(template.format(metric + ":", score, fmt_spec=fmt_spec))
+    for label, value in coverage.cli_lines():
+        click.echo(template.format(label + ":", value, fmt_spec="d"))
     if metrics_file:
-        json.dump(
-            {metric_code(mname): val for mname, val in metrics.items()},
-            metrics_file,
-            indent=2,
-        )
+        metric_results = {metric_code(mname): val for mname, val in metrics.items()}
+        metric_results.update(coverage.as_dict())
+        json.dump(metric_results, metrics_file, indent=2)
+    if results_file:
+        coverage.write_results_file_footer(results_file)
 
 
 @cli.command("run")
@@ -570,8 +588,18 @@ def run_optimize(project_id, paths, jobs, docs_limit, backend_param):
     import annif.eval
 
     corpus = cli_util.open_documents(
-        paths, project.subjects, project.vocab_lang, docs_limit
+        paths,
+        project.subjects,
+        project.vocab_lang,
+        docs_limit,
+        retain_subjectless=True,
     )
+
+    # only documents with a valid gold standard may take part in threshold
+    # optimization; fail before suggestions are generated if none exist
+    coverage = GoldCorpusCoverage.from_corpus(corpus)
+    coverage.require_scorable_documents()
+    scorable_corpus = ScorableDocumentCorpus(corpus)
 
     jobs, pool_class = annif.parallel.get_pool(jobs)
 
@@ -589,7 +617,7 @@ def run_optimize(project_id, paths, jobs, docs_limit, backend_param):
     subject_set_batches = []
     with pool_class(jobs) as pool:
         for suggestion_batch, subject_sets in pool.imap_unordered(
-            psmap.suggest_batch, corpus.doc_batches
+            psmap.suggest_batch, scorable_corpus.doc_batches
         ):
             ndocs += len(suggestion_batch[project_id])
             suggestion_batches.append(suggestion_batch[project_id])
@@ -639,6 +667,8 @@ def run_optimize(project_id, paths, jobs, docs_limit, backend_param):
             )
         )
     click.echo("Documents evaluated:\t{}".format(ndocs))
+    for label, value in coverage.cli_lines():
+        click.echo(f"{label}:\t{value}")
 
 
 @cli.command("hyperopt")
@@ -667,16 +697,38 @@ def run_hyperopt(project_id, paths, docs_limit, trials, jobs, metric, results_fi
     and a report of the best performing parameters.
     """
     proj = cli_util.get_project(project_id)
+
+    import annif.backend.hyperopt
+
+    if not isinstance(proj.backend, annif.backend.hyperopt.AnnifHyperoptBackend):
+        raise NotSupportedException(
+            "Hyperparameter optimization not supported by backend"
+        )
+
     documents = cli_util.open_documents(
-        paths, proj.subjects, proj.vocab_lang, docs_limit
+        paths,
+        proj.subjects,
+        proj.vocab_lang,
+        docs_limit,
+        retain_subjectless=True,
     )
+
+    # hyperparameter trials may only use documents with a valid gold
+    # standard; fail before any trial is started if none exist
+    coverage = GoldCorpusCoverage.from_corpus(documents)
+    coverage.require_scorable_documents()
+    scorable_documents = ScorableDocumentCorpus(documents)
+
     click.echo(f"Looking for optimal hyperparameters using {trials} trials")
-    rec = proj.hyperopt(documents, trials, jobs, metric, results_file)
+    rec = proj.hyperopt(scorable_documents, trials, jobs, metric, results_file)
     click.echo(f"Got best {metric} score {rec.score:.4f} with:")
     click.echo("---")
     for line in rec.lines:
         click.echo(line)
     click.echo("---")
+    click.echo(f"Documents evaluated:\t{coverage.scored_documents}")
+    for label, value in coverage.cli_lines():
+        click.echo(f"{label}:\t{value}")
 
 
 @cli.command("upload")
