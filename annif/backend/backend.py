@@ -26,19 +26,42 @@ class AnnifBackend(metaclass=abc.ABCMeta):
 
     DEFAULT_PARAMETERS = {"limit": 100}
 
+    #: True for backends that persist trained model files in the project
+    #: datadir. Such backends are retrained via the atomic model generation
+    #: machinery. Backends without persistent model files (dummy, http,
+    #: yake and ensemble) override this to False and use the datadir root
+    #: directly, preserving their original behavior.
+    versioned_model = True
+
     def __init__(
         self,
         backend_id: str,
         config_params: dict[str, Any] | SectionProxy,
         project: AnnifProject,
+        datadir: str | None = None,
     ) -> None:
         """Initialize backend with specific parameters. The
         parameters are a dict. Keys and values depend on the specific
-        backend type."""
+        backend type. An explicit datadir may be given to bind the backend
+        to a specific model generation (e.g. a training candidate);
+        otherwise the active model directory of the project is used."""
         self.backend_id = backend_id
         self.config_params = config_params
         self.project = project
-        self.datadir = project.datadir
+        self._datadir_override = datadir
+
+    @property
+    def datadir(self) -> str:
+        if self._datadir_override is not None:
+            return self._datadir_override
+        if self.versioned_model:
+            # Resolve via the class so that mock projects used in unit
+            # tests (which lack this method) keep working with a plain
+            # datadir attribute.
+            resolver = getattr(type(self.project), "active_model_dir", None)
+            if callable(resolver):
+                return resolver(self.project)
+        return self.project.datadir
 
     def default_params(self) -> dict[str, Any]:
         params = AnnifBackend.DEFAULT_PARAMETERS.copy()
@@ -56,7 +79,13 @@ class AnnifBackend(metaclass=abc.ABCMeta):
     def _model_file_paths(self) -> list:
         all_paths = glob(os.path.join(self.datadir, "**"), recursive=True)
         file_paths = [p for p in all_paths if os.path.isfile(p)]
-        ignore_patterns = ("*-train*", "tmp-*", "vectorizer")
+        ignore_patterns = (
+            "*-train*",
+            "tmp-*",
+            "vectorizer",
+            "manifest.json",
+            "activation-error.json",
+        )
         ignore_paths = [
             path
             for igp in ignore_patterns

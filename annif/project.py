@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
 import os.path
 import re
+import threading
 from shutil import rmtree
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import annif
 import annif.analyzer
 import annif.backend
 import annif.corpus
+import annif.model
 import annif.transform
 from annif.corpus import Document
 from annif.datadir import DatadirMixin
@@ -37,6 +41,7 @@ if TYPE_CHECKING:
     from annif.backend.hyperopt import HPRecommendation
     from annif.corpus import DocumentCorpus
     from annif.corpus.subject import SubjectIndex
+    from annif.model import ModelGenerationManager
     from annif.registry import AnnifRegistry
     from annif.transform.transform import TransformChain
     from annif.vocab import AnnifVocabulary
@@ -63,6 +68,7 @@ class AnnifProject(DatadirMixin):
     _vocab_lang = None
     _vocab_kwargs = {}
     _subject_index = None
+    _model_manager = None
     initialized = False
 
     # default values for configuration settings
@@ -85,6 +91,7 @@ class AnnifProject(DatadirMixin):
         self.config = config
         self._base_datadir = datadir
         self.registry = registry
+        self._backend_lock = threading.Lock()
         self._init_access()
 
     def _init_access(self) -> None:
@@ -143,12 +150,17 @@ class AnnifProject(DatadirMixin):
     def _suggest_with_backend(
         self,
         docs: list[Document],
+        backend: AnnifBackend,
         backend_params: defaultdict[str, dict] | None,
     ) -> annif.suggestion.SuggestionBatch:
         if backend_params is None:
             backend_params = {}
-        beparams = backend_params.get(self.backend.backend_id, {})
-        return self.backend.suggest(docs, beparams)
+        beparams = backend_params.get(backend.backend_id, {})
+        # Use the backend instance captured at the start of the request: a
+        # generation switch may replace the cached active instance while the
+        # request is in flight, but in-flight requests keep serving with the
+        # instance they started with.
+        return backend.suggest(docs, beparams)
 
     @property
     def analyzer(self) -> Analyzer:
@@ -170,25 +182,52 @@ class AnnifProject(DatadirMixin):
         return self._transform
 
     @property
+    def model_manager(self) -> ModelGenerationManager:
+        """Return the manager for the on-disk model generations."""
+        if self._model_manager is None:
+            self._model_manager = annif.model.ModelGenerationManager(self)
+        return self._model_manager
+
+    def active_model_dir(self) -> str:
+        """Return the directory that holds the active model generation.
+        Projects that predate model generations (and untrained projects)
+        use the project data directory root."""
+        return self.model_manager.active_model_dir()
+
+    @property
     def backend(self) -> AnnifBackend | None:
         if self._backend is None:
-            if "backend" not in self.config:
-                raise ConfigurationException(
-                    "backend setting is missing", project_id=self.project_id
-                )
-            backend_id = self.config["backend"]
-            try:
-                backend_class = annif.backend.get_backend(backend_id)
-                self._backend = backend_class(
-                    backend_id, config_params=self.config, project=self
-                )
-            except ValueError:
-                logger.warning(
-                    "Could not create backend %s, "
-                    "make sure you've installed optional dependencies",
-                    backend_id,
-                )
+            with self._backend_lock:
+                if self._backend is None:
+                    self._backend = self._create_backend()
         return self._backend
+
+    def _create_backend(self, model_dir: str | None = None) -> AnnifBackend | None:
+        """Create a backend instance bound to the given model directory, or
+        to the active model generation when no directory is given."""
+        if "backend" not in self.config:
+            raise ConfigurationException(
+                "backend setting is missing", project_id=self.project_id
+            )
+        backend_id = self.config["backend"]
+        try:
+            backend_class = annif.backend.get_backend(backend_id)
+        except ValueError:
+            logger.warning(
+                "Could not create backend %s, "
+                "make sure you've installed optional dependencies",
+                backend_id,
+            )
+            return None
+        if model_dir is None:
+            model_dir = (
+                self.active_model_dir()
+                if backend_class.versioned_model
+                else self.datadir
+            )
+        return backend_class(
+            backend_id, config_params=self.config, project=self, datadir=model_dir
+        )
 
     def _initialize_vocab(self) -> None:
         if self.vocab_spec is None:
@@ -263,13 +302,19 @@ class AnnifProject(DatadirMixin):
         backend_params: defaultdict[str, dict] | None = None,
     ) -> annif.suggestion.SuggestionBatch:
         """Suggest subjects for the given documents batch."""
-        if not self.is_trained:
-            if self.is_trained is None:
+        backend = self.backend
+        try:
+            is_trained = backend.is_trained
+        except AnnifException as err:
+            logger.warning(err.format_message())
+            is_trained = None
+        if not is_trained:
+            if is_trained is None:
                 logger.warning("Could not get train state information.")
             else:
                 raise NotInitializedException("Project is not trained.")
         transformed_docs = [self.transform.transform_doc(doc) for doc in documents]
-        return self._suggest_with_backend(transformed_docs, backend_params)
+        return self._suggest_with_backend(transformed_docs, backend, backend_params)
 
     def train(
         self,
@@ -277,13 +322,67 @@ class AnnifProject(DatadirMixin):
         backend_params: defaultdict[str, dict] | None = None,
         jobs: int = 0,
     ) -> None:
-        """train the project using documents from a metadata source"""
-        if corpus != "cached":
+        """train the project using documents from a metadata source.
+
+        Backends with persistent model files are trained in an isolated
+        candidate directory by the unique lock owner, validated, probed and
+        published atomically as a new model generation; the active backend
+        instance is only switched after the publish succeeds. Backends
+        without persistent model files are trained exactly as before."""
+
+        backend = self.backend
+        use_cached = corpus == "cached"
+        if not use_cached:
             corpus = self.transform.transform_corpus(corpus)
         if backend_params is None:
             backend_params = {}
-        beparams = backend_params.get(self.backend.backend_id, {})
-        self.backend.train(corpus, beparams, jobs)
+        beparams = backend_params.get(backend.backend_id, {})
+        if not backend.versioned_model:
+            backend.train(corpus, beparams, jobs)
+            return
+        # the parameter version pinned in the manifest is the effective
+        # parameter set the backend trains with (defaults + config + CLI)
+        effective_params = backend._get_backend_params(beparams)
+        self._train_versioned(
+            backend, corpus, beparams, effective_params, jobs, use_cached
+        )
+
+    def _train_versioned(
+        self,
+        backend: AnnifBackend,
+        corpus: DocumentCorpus | str,
+        beparams: dict[str, Any],
+        effective_params: dict[str, Any],
+        jobs: int,
+        use_cached: bool,
+    ) -> None:
+        """Train a file-backed backend as a new, atomically published model
+        generation."""
+
+        manager = self.model_manager
+        with manager.ownership("train") as owner:
+            parent = manager.active_generation_id()
+            if use_cached:
+                # the cached training data was produced by a previous run, so
+                # its corpus fingerprint remains the one to pin
+                parent_manifest = manager.active_manifest()
+                if parent_manifest is not None:
+                    corpus_info = parent_manifest["fingerprint"]["corpus"]
+                else:
+                    corpus_info = {"documents": None, "sha256": None, "cached": True}
+                manager.seed_from_active(owner.staging_dir, include_train_data=True)
+            else:
+                corpus_info = annif.model.corpus_fingerprint(corpus)
+            candidate = self._create_backend(owner.staging_dir)
+            candidate.train(corpus, beparams, jobs)
+            self._publish_candidate(
+                owner,
+                candidate,
+                effective_params,
+                corpus_info,
+                operation="train",
+                parent=parent,
+            )
 
     def learn(
         self,
@@ -291,21 +390,155 @@ class AnnifProject(DatadirMixin):
         backend_params: defaultdict[str, dict] | None = None,
     ) -> None:
         """further train the project using documents from a metadata source"""
-        if backend_params is None:
-            backend_params = {}
-        beparams = backend_params.get(self.backend.backend_id, {})
-        corpus = self.transform.transform_corpus(corpus)
-        if isinstance(self.backend, annif.backend.backend.AnnifLearningBackend):
-            if annif.util.boolean(self.config.get("allow_learn", False)):
-                self.backend.learn(corpus, beparams)
-            else:
-                raise NotEnabledException(
-                    "Learning not enabled for project", project_id=self.project_id
-                )
-        else:
+        if not isinstance(self.backend, annif.backend.backend.AnnifLearningBackend):
             raise NotSupportedException(
                 "Learning not supported by backend", project_id=self.project_id
             )
+        if not annif.util.boolean(self.config.get("allow_learn", False)):
+            raise NotEnabledException(
+                "Learning not enabled for project", project_id=self.project_id
+            )
+
+        backend = self.backend
+        if backend_params is None:
+            backend_params = {}
+        beparams = backend_params.get(backend.backend_id, {})
+        corpus = self.transform.transform_corpus(corpus)
+        if not backend.versioned_model:
+            backend.learn(corpus, beparams)
+            return
+        effective_params = backend._get_backend_params(beparams)
+        self._learn_versioned(backend, corpus, effective_params)
+
+    def _learn_versioned(
+        self,
+        backend: AnnifBackend,
+        corpus: DocumentCorpus,
+        effective_params: dict[str, Any],
+    ) -> None:
+        """Further train a file-backed backend by seeding a candidate from
+        the active generation and publishing the result as a new
+        generation."""
+
+        manager = self.model_manager
+        with manager.ownership("learn") as owner:
+            parent = manager.active_generation_id()
+            manager.seed_from_active(owner.staging_dir, include_train_data=False)
+            candidate = self._create_backend(owner.staging_dir)
+            corpus_info = annif.model.corpus_fingerprint(corpus)
+            candidate.learn(corpus, effective_params)
+            self._publish_candidate(
+                owner,
+                candidate,
+                effective_params,
+                corpus_info,
+                operation="learn",
+                parent=parent,
+            )
+
+    def _publish_candidate(
+        self,
+        owner,
+        candidate: AnnifBackend,
+        beparams: dict[str, Any],
+        corpus_info: dict[str, Any],
+        operation: str,
+        parent: str | None,
+    ) -> None:
+        """Validate, probe and atomically publish a trained candidate
+        generation, then switch the cached active backend instance."""
+
+        manager = self.model_manager
+        files = manager.finalize_candidate(owner.staging_dir)
+        # Probe with a separate instance that loads the written files cold,
+        # simulating how the generation will be used after a restart.
+        probe = self._create_backend(owner.staging_dir)
+        annif.model.probe_backend(probe, beparams)
+        fingerprint = self._model_fingerprint(beparams, corpus_info)
+        generation_id = manager.new_generation_id(fingerprint["sha256"], owner.token)
+        manager.write_manifest(
+            owner.staging_dir,
+            generation_id=generation_id,
+            operation=operation,
+            parent=parent,
+            fingerprint=fingerprint,
+            files=files,
+        )
+        manager.commit(owner, generation_id)
+        previous = parent
+        manager.publish_pointer(generation_id, previous)
+        try:
+            activated = self._create_backend(manager.generation_dir(generation_id))
+            activated.initialize()
+        except AnnifException as err:
+            # files were published, but the live instance cannot use them:
+            # roll the active generation back and keep diagnostics
+            manager.rollback_after_activation_failure(generation_id, previous, err)
+            raise
+        with self._backend_lock:
+            self._backend = activated
+        manager.prune_generations()
+        logger.info(
+            "Project '%s': published model generation %s via %s",
+            self.project_id,
+            generation_id,
+            operation,
+        )
+
+    def _model_fingerprint(
+        self, beparams: dict[str, Any], corpus_info: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Build the fingerprint pinning the analyzer, vocabulary, backend
+        parameter and corpus versions of a model generation."""
+
+        analyzer_info: dict[str, Any] = {"spec": self.analyzer_spec}
+        try:
+            analyzer = self.analyzer
+            analyzer_info.update(
+                {
+                    "name": getattr(analyzer, "name", None),
+                    "param": getattr(analyzer, "param", None),
+                    "token_min_length": getattr(analyzer, "token_min_length", None),
+                }
+            )
+        except AnnifException:
+            pass
+
+        vocab_info: dict[str, Any] = {
+            "spec": self.vocab_spec,
+            "id": None,
+            "language": self.vocab_lang,
+            "kwargs": dict(sorted(self._vocab_kwargs.items())),
+        }
+        try:
+            vocab = self.vocab
+            vocab_info["id"] = vocab.vocab_id
+            vocab_info["subjects"] = len(vocab.subjects)
+            subjects_path = os.path.join(vocab.datadir, vocab.INDEX_FILENAME_CSV)
+            if os.path.exists(subjects_path):
+                stat = os.stat(subjects_path)
+                vocab_info["subjects_file"] = {
+                    "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+        except AnnifException:
+            pass
+
+        backend_info = {
+            "id": self.config.get("backend"),
+            "params": {key: beparams[key] for key in sorted(beparams)},
+        }
+        components = {
+            "analyzer": analyzer_info,
+            "vocab": vocab_info,
+            "backend": backend_info,
+            "corpus": corpus_info,
+        }
+        canonical = json.dumps(
+            components, sort_keys=True, default=str, ensure_ascii=False
+        )
+        components["sha256"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return components
 
     def hyperopt(
         self,
@@ -352,6 +585,9 @@ class AnnifProject(DatadirMixin):
         datadir_path = self._datadir_path
         if os.path.isdir(datadir_path):
             rmtree(datadir_path)
+            with self._backend_lock:
+                self._backend = None
+            self._model_manager = None
             logger.info("Removed model data for project {}.".format(self.project_id))
         else:
             logger.warning(

@@ -110,12 +110,19 @@ def _prepare_config_commit(project: AnnifProject) -> tuple[io.BytesIO, Any]:
 
 
 def _is_train_path(path: pathlib.Path) -> bool:
-    # Detect if the path includes a training data pattern
+    # Detect if the path includes a training data pattern or internal
+    # bookkeeping of model generations (locks, staging candidates and
+    # diagnostics). Published generations, manifests and the current
+    # generation pointer are archived so that downloads remain usable.
     train_path_patterns = ("-train", "tmp-")
+    internal_parts = (".staging", ".model-lock", "diagnostics")
     for pat in train_path_patterns:
         for part in path.parts:
             if pat in part:
                 return True
+    for part in path.parts:
+        if part in internal_parts or part.startswith("."):
+            return True
     return False
 
 

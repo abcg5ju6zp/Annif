@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 class HTTPBackend(backend.AnnifBackend):
     name = "http"
+    # suggestions are delegated to a remote HTTP service, so there are no
+    # local model files or model generations to manage
+    versioned_model = False
     _headers = None
 
     @property

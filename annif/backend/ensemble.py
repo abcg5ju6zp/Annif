@@ -163,6 +163,10 @@ class EnsembleBackend(BaseEnsembleBackend, hyperopt.AnnifHyperoptBackend):
 
     name = "ensemble"
 
+    # the plain ensemble backend stores no model files of its own; its
+    # state is fully determined by the source projects
+    versioned_model = False
+
     @property
     def is_trained(self) -> bool:
         sources_trained = self._get_sources_attribute("is_trained")

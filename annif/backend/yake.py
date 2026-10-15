@@ -30,6 +30,10 @@ class YakeBackend(backend.AnnifBackend):
 
     name = "yake"
 
+    # the index is derived from the vocabulary and created on demand;
+    # yake does not support training and needs no model generations
+    versioned_model = False
+
     # defaults for uninitialized instances
     _index = None
     _graph = None

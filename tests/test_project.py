@@ -174,10 +174,17 @@ def test_project_tfidf_modification_time_prepared_only(registry, testdatadir):
 
 
 def test_project_train_tfidf(registry, document_corpus, testdatadir):
+    import os.path
+
     project = registry.get_project("tfidf-fi")
     project.train(document_corpus)
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").exists()
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").size() > 0
+    # the model files of the published generation live in an isolated
+    # generation directory rather than the project data directory root
+    model_dir = project.backend.datadir
+    assert os.path.basename(os.path.dirname(model_dir)) == "generations"
+    assert testdatadir.join("projects/tfidf-fi/current.json").exists()
+    assert os.path.isfile(os.path.join(model_dir, "tfidf-matrix.npz"))
+    assert os.path.getsize(os.path.join(model_dir, "tfidf-matrix.npz")) > 0
 
 
 def test_project_tfidf_is_trained(registry):

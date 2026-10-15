@@ -15,6 +15,9 @@ if TYPE_CHECKING:
 
 class DummyBackend(backend.AnnifLearningBackend):
     name = "dummy"
+    # the dummy backend keeps its (trivial) state only in memory and never
+    # writes model files, so model generations do not apply to it
+    versioned_model = False
     initialized = False
     subject_id = 0
     is_trained = True

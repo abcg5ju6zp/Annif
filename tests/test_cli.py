@@ -28,6 +28,14 @@ TEMP_PROJECT = "".join(random.choice("abcdefghiklmnopqrstuvwxyz") for _ in range
 PROJECTS_CONFIG_PATH = "tests/projects_for_config_path_option.cfg"
 
 
+def active_model_dir(testdatadir, project_id):
+    """Return the py.path of the active model generation of a project,
+    following the current-generation pointer on disk."""
+    project_dir = testdatadir.join("projects", project_id)
+    pointer = json.loads(project_dir.join("current.json").read())
+    return project_dir.join("generations", pointer["generation"])
+
+
 def test_list_projects():
     result = runner.invoke(annif.cli.cli, ["list-projects"])
     assert not result.exception
@@ -298,10 +306,11 @@ def test_train_tsv(testdatadir):
     result = runner.invoke(annif.cli.cli, ["train", "tfidf-fi", docfile])
     assert not result.exception
     assert result.exit_code == 0
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").exists()
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").size() > 0
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").exists()
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").size() > 0
+    model_dir = active_model_dir(testdatadir, "tfidf-fi")
+    assert model_dir.join("vectorizer").exists()
+    assert model_dir.join("vectorizer").size() > 0
+    assert model_dir.join("tfidf-matrix.npz").exists()
+    assert model_dir.join("tfidf-matrix.npz").size() > 0
 
 
 def test_train_csv(testdatadir):
@@ -311,10 +320,11 @@ def test_train_csv(testdatadir):
     result = runner.invoke(annif.cli.cli, ["train", "tfidf-fi", docfile])
     assert not result.exception
     assert result.exit_code == 0
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").exists()
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").size() > 0
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").exists()
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").size() > 0
+    model_dir = active_model_dir(testdatadir, "tfidf-fi")
+    assert model_dir.join("vectorizer").exists()
+    assert model_dir.join("vectorizer").size() > 0
+    assert model_dir.join("tfidf-matrix.npz").exists()
+    assert model_dir.join("tfidf-matrix.npz").size() > 0
 
 
 def test_train_jsonl(testdatadir):
@@ -326,10 +336,11 @@ def test_train_jsonl(testdatadir):
     )
     assert not result.exception
     assert result.exit_code == 0
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").exists()
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").size() > 0
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").exists()
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").size() > 0
+    model_dir = active_model_dir(testdatadir, "tfidf-fi")
+    assert model_dir.join("vectorizer").exists()
+    assert model_dir.join("vectorizer").size() > 0
+    assert model_dir.join("tfidf-matrix.npz").exists()
+    assert model_dir.join("tfidf-matrix.npz").size() > 0
 
 
 def test_train_multiple(testdatadir):
@@ -344,10 +355,11 @@ def test_train_multiple(testdatadir):
     )
     assert not result.exception
     assert result.exit_code == 0
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").exists()
-    assert testdatadir.join("projects/tfidf-fi/vectorizer").size() > 0
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").exists()
-    assert testdatadir.join("projects/tfidf-fi/tfidf-matrix.npz").size() > 0
+    model_dir = active_model_dir(testdatadir, "tfidf-fi")
+    assert model_dir.join("vectorizer").exists()
+    assert model_dir.join("vectorizer").size() > 0
+    assert model_dir.join("tfidf-matrix.npz").exists()
+    assert model_dir.join("tfidf-matrix.npz").size() > 0
 
 
 def test_train_cached(testdatadir):
